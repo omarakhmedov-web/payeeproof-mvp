@@ -15,7 +15,7 @@ from flask import Flask, jsonify, request
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-APP_VERSION = "0.1.0-mvp-issuer"
+APP_VERSION = "0.1.1-mvp-demo"
 ARTIFACT_VERSION = "pp_v1"
 ALGORITHM = "Ed25519"
 PAYLOAD_FIELDS = [
@@ -44,8 +44,18 @@ API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "/tmp/payeeproof_mvp.db")
 DEFAULT_TTL_MINUTES = int(os.getenv("DEFAULT_TTL_MINUTES", "10"))
 DEFAULT_KEY_VERSION = os.getenv("KEY_VERSION", "ed25519-dev-v1")
+DEMO_ALLOWED_ORIGINS = {
+    origin.strip()
+    for origin in os.getenv(
+        "DEMO_ALLOWED_ORIGINS",
+        "https://payeeproof.com,https://www.payeeproof.com,http://127.0.0.1:5500,http://localhost:5500,http://localhost:3000",
+    ).split(",")
+    if origin.strip()
+}
+DEMO_RATE_LIMIT_PER_MINUTE = int(os.getenv("DEMO_RATE_LIMIT_PER_MINUTE", "30"))
 
 app = Flask(__name__)
+_demo_hits: dict[str, list[float]] = {}
 
 
 def now_utc() -> datetime:
@@ -260,6 +270,108 @@ def build_artifact(row: sqlite3.Row) -> Dict[str, Any]:
     }
 
 
+def request_origin() -> str:
+    return request.headers.get("Origin", "").strip()
+
+
+def is_demo_origin_allowed(origin: str) -> bool:
+    return bool(origin) and origin in DEMO_ALLOWED_ORIGINS
+
+
+def client_ip() -> str:
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def demo_rate_limited(ip: str) -> bool:
+    import time
+
+    now_ts = time.time()
+    window_start = now_ts - 60
+    hits = [ts for ts in _demo_hits.get(ip, []) if ts >= window_start]
+    if len(hits) >= DEMO_RATE_LIMIT_PER_MINUTE:
+        _demo_hits[ip] = hits
+        return True
+    hits.append(now_ts)
+    _demo_hits[ip] = hits
+    return False
+
+
+def build_demo_result(
+    expected: Dict[str, str],
+    provided: Dict[str, str],
+    ownership_proof_status: str = "verified",
+    simulate_expired: bool = False,
+) -> Dict[str, Any]:
+    status = "verified"
+    reason_code = "OK"
+    retry_allowed = False
+    next_action = "ALLOW_PAYOUT_IF_ARTIFACT_VALID"
+    summary = "All payout details match the request."
+
+    if simulate_expired:
+        status = "expired"
+        reason_code = "REQUEST_EXPIRED"
+        retry_allowed = False
+        next_action = "BLOCK_AND_REVERIFY"
+        summary = "The verification session expired before completion."
+    elif ownership_proof_status != "verified":
+        status = "blocked"
+        reason_code = "OWNERSHIP_PROOF_FAILED"
+        retry_allowed = False
+        next_action = "BLOCK_AND_REVERIFY"
+        summary = "Wallet ownership could not be verified."
+    elif provided["network"] != expected["network"]:
+        status = "mismatch_detected"
+        reason_code = "NETWORK_MISMATCH"
+        retry_allowed = True
+        next_action = "BLOCK_AND_REVERIFY"
+        summary = "The provided network does not match the expected payout network."
+    elif provided["asset"] != expected["asset"]:
+        status = "mismatch_detected"
+        reason_code = "ASSET_MISMATCH"
+        retry_allowed = True
+        next_action = "BLOCK_AND_REVERIFY"
+        summary = "The provided asset does not match the requested payout asset."
+    elif provided["address"] != expected["address"]:
+        status = "mismatch_detected"
+        reason_code = "ADDRESS_MISMATCH"
+        retry_allowed = True
+        next_action = "BLOCK_AND_REVERIFY"
+        summary = "The provided wallet address differs from the expected destination."
+
+    return {
+        "demo_only": True,
+        "status": status,
+        "reason_code": reason_code,
+        "retry_allowed": retry_allowed,
+        "next_action": next_action,
+        "summary": summary,
+        "expected": expected,
+        "provided": provided,
+        "ownership_proof_status": ownership_proof_status,
+        "simulated_expired": simulate_expired,
+        "audit_preview": {
+            "event_type": "demo_verification_completed",
+            "created_at": iso_z(now_utc()),
+        },
+    }
+
+
+@app.after_request
+def add_demo_cors_headers(response: Any) -> Any:
+    if request.path.startswith("/demo/"):
+        origin = request_origin()
+        if is_demo_origin_allowed(origin):
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            response.headers["Vary"] = "Origin"
+    return response
+
+
 @app.get("/health")
 def health() -> Any:
     return jsonify({"ok": True, "service": "payeeproof-issuer", "version": APP_VERSION})
@@ -276,6 +388,7 @@ def root() -> Any:
             "POST /v1/verification-requests",
             "POST /v1/verification-sessions/<session_id>/complete",
             "GET /v1/verification-requests/<request_id>/artifact",
+            "POST /demo/verify",
         ],
     })
 
@@ -559,6 +672,59 @@ def get_artifact(request_id: str) -> Any:
     artifact = json.loads(row["artifact_json"])
     conn.close()
     return jsonify({"request_id": request_id, "artifact": artifact})
+
+
+@app.route("/demo/verify", methods=["POST", "OPTIONS"])
+def demo_verify() -> Any:
+    origin = request_origin()
+
+    if request.method == "OPTIONS":
+        if origin and not is_demo_origin_allowed(origin):
+            return jsonify({"error": "DEMO_ORIGIN_NOT_ALLOWED"}), 403
+        return ("", 204)
+
+    if origin and not is_demo_origin_allowed(origin):
+        return jsonify({"error": "DEMO_ORIGIN_NOT_ALLOWED"}), 403
+
+    if demo_rate_limited(client_ip()):
+        return jsonify({
+            "error": "RATE_LIMITED",
+            "message": "Too many demo requests. Please wait a minute and retry.",
+        }), 429
+
+    body = json_body()
+    expected_in = body.get("expected") or {}
+    provided_in = body.get("provided") or {}
+
+    expected = {
+        "network": normalize_network(expected_in.get("network")),
+        "asset": normalize_asset(expected_in.get("asset")),
+        "address": normalize_address(expected_in.get("network"), expected_in.get("address")),
+    }
+    provided = {
+        "network": normalize_network(provided_in.get("network")),
+        "asset": normalize_asset(provided_in.get("asset")),
+        "address": normalize_address(provided_in.get("network"), provided_in.get("address")),
+    }
+
+    expected_error = validate_expected(expected["network"], expected["asset"], expected["address"])
+    if expected_error:
+        return jsonify({"error": expected_error, "field": "expected"}), 400
+
+    provided_error = validate_expected(provided["network"], provided["asset"], provided["address"])
+    if provided_error:
+        return jsonify({"error": provided_error, "field": "provided"}), 400
+
+    ownership_proof_status = str(body.get("ownership_proof_status") or "verified").strip().lower()
+    simulate_expired = bool(body.get("simulate_expired", False))
+
+    result = build_demo_result(
+        expected=expected,
+        provided=provided,
+        ownership_proof_status=ownership_proof_status,
+        simulate_expired=simulate_expired,
+    )
+    return jsonify(result)
 
 
 if __name__ == "__main__":
