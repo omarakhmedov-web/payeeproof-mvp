@@ -4,21 +4,22 @@ import base64
 import hashlib
 import json
 import os
+import html
+import urllib.error
+import urllib.request
 import secrets
-import smtplib
 import sqlite3
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
-from email.message import EmailMessage
 
 from flask import Flask, jsonify, request
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-APP_VERSION = "0.1.2-mvp-contact"
+APP_VERSION = "0.1.3-mvp-contact-resend"
 ARTIFACT_VERSION = "pp_v1"
 ALGORITHM = "Ed25519"
 PAYLOAD_FIELDS = [
@@ -66,12 +67,9 @@ PILOT_ALLOWED_ORIGINS = {
 }
 PILOT_RATE_LIMIT_PER_10_MIN = int(os.getenv("PILOT_RATE_LIMIT_PER_10_MIN", "5"))
 PILOT_REQUEST_TO = os.getenv("PILOT_REQUEST_TO", "hello@payeeproof.com").strip()
-SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "").strip()
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "hello@payeeproof.com").strip()
-SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").strip().lower() in {"1", "true", "yes", "on"}
+RESEND_API_BASE = os.getenv("RESEND_API_BASE", "https://api.resend.com").rstrip("/")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+RESEND_FROM = os.getenv("RESEND_FROM", "PayeeProof <hello@payeeproof.com>").strip()
 
 app = Flask(__name__)
 _demo_hits: dict[str, list[float]] = {}
@@ -864,13 +862,19 @@ def pilot_request() -> Any:
     try:
         send_pilot_request_email(payload)
     except RuntimeError as exc:
-        if str(exc) == "PILOT_EMAIL_NOT_CONFIGURED":
+        error_code = str(exc)
+        if error_code == "PILOT_EMAIL_NOT_CONFIGURED":
             return jsonify({
                 "error": "PILOT_EMAIL_NOT_CONFIGURED",
                 "message": "Pilot request email is not configured on the server yet.",
             }), 500
-        raise
+        app.logger.exception("Pilot request email delivery failed: %s", error_code)
+        return jsonify({
+            "error": "EMAIL_DELIVERY_FAILED",
+            "message": "Could not send your request right now. Please try again in a moment.",
+        }), 502
     except Exception:
+        app.logger.exception("Pilot request email delivery failed with unexpected error")
         return jsonify({
             "error": "EMAIL_DELIVERY_FAILED",
             "message": "Could not send your request right now. Please try again in a moment.",
