@@ -5,17 +5,20 @@ import hashlib
 import json
 import os
 import secrets
+import smtplib
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+from email.message import EmailMessage
 
 from flask import Flask, jsonify, request
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-APP_VERSION = "0.1.1-mvp-demo"
+APP_VERSION = "0.1.2-mvp-contact"
 ARTIFACT_VERSION = "pp_v1"
 ALGORITHM = "Ed25519"
 PAYLOAD_FIELDS = [
@@ -53,9 +56,26 @@ DEMO_ALLOWED_ORIGINS = {
     if origin.strip()
 }
 DEMO_RATE_LIMIT_PER_MINUTE = int(os.getenv("DEMO_RATE_LIMIT_PER_MINUTE", "30"))
+PILOT_ALLOWED_ORIGINS = {
+    origin.strip()
+    for origin in os.getenv(
+        "PILOT_ALLOWED_ORIGINS",
+        "https://payeeproof.com,https://www.payeeproof.com,http://127.0.0.1:5500,http://localhost:5500,http://localhost:3000",
+    ).split(",")
+    if origin.strip()
+}
+PILOT_RATE_LIMIT_PER_10_MIN = int(os.getenv("PILOT_RATE_LIMIT_PER_10_MIN", "5"))
+PILOT_REQUEST_TO = os.getenv("PILOT_REQUEST_TO", "hello@payeeproof.com").strip()
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "hello@payeeproof.com").strip()
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 app = Flask(__name__)
 _demo_hits: dict[str, list[float]] = {}
+_pilot_hits: dict[str, list[float]] = {}
 
 
 def now_utc() -> datetime:
@@ -278,6 +298,10 @@ def is_demo_origin_allowed(origin: str) -> bool:
     return bool(origin) and origin in DEMO_ALLOWED_ORIGINS
 
 
+def is_pilot_origin_allowed(origin: str) -> bool:
+    return bool(origin) and origin in PILOT_ALLOWED_ORIGINS
+
+
 def client_ip() -> str:
     forwarded_for = request.headers.get("X-Forwarded-For", "")
     if forwarded_for:
@@ -285,18 +309,72 @@ def client_ip() -> str:
     return request.remote_addr or "unknown"
 
 
-def demo_rate_limited(ip: str) -> bool:
-    import time
-
+def rate_limited(store: dict[str, list[float]], key: str, max_hits: int, window_seconds: int) -> bool:
     now_ts = time.time()
-    window_start = now_ts - 60
-    hits = [ts for ts in _demo_hits.get(ip, []) if ts >= window_start]
-    if len(hits) >= DEMO_RATE_LIMIT_PER_MINUTE:
-        _demo_hits[ip] = hits
+    window_start = now_ts - window_seconds
+    hits = [ts for ts in store.get(key, []) if ts >= window_start]
+    if len(hits) >= max_hits:
+        store[key] = hits
         return True
     hits.append(now_ts)
-    _demo_hits[ip] = hits
+    store[key] = hits
     return False
+
+
+def demo_rate_limited(ip: str) -> bool:
+    return rate_limited(_demo_hits, ip, DEMO_RATE_LIMIT_PER_MINUTE, 60)
+
+
+def pilot_rate_limited(ip: str) -> bool:
+    return rate_limited(_pilot_hits, ip, PILOT_RATE_LIMIT_PER_10_MIN, 600)
+
+
+def valid_email(value: str) -> bool:
+    value = str(value or "").strip()
+    if not value or "@" not in value:
+        return False
+    local, _, domain = value.partition("@")
+    return bool(local and domain and "." in domain and " " not in value)
+
+
+def send_pilot_request_email(payload: Dict[str, str]) -> None:
+    if not SMTP_HOST:
+        raise RuntimeError("PILOT_EMAIL_NOT_CONFIGURED")
+
+    msg = EmailMessage()
+    msg["Subject"] = f"New PayeeProof pilot request — {payload['company']}"
+    msg["From"] = SMTP_FROM
+    msg["To"] = PILOT_REQUEST_TO
+    msg["Reply-To"] = payload["email"]
+    msg.set_content(
+        "\n".join(
+            [
+                "New PayeeProof pilot request",
+                "",
+                f"Name: {payload['name']}",
+                f"Company / team: {payload['company']}",
+                f"Work email: {payload['email']}",
+                f"Monthly payout volume: {payload['volume'] or 'Not provided'}",
+                "",
+                "Use case / flow:",
+                payload["notes"],
+                "",
+                f"Submitted at (UTC): {iso_z(now_utc())}",
+                f"Origin: {payload['origin'] or 'Not provided'}",
+                f"IP: {payload['ip']}",
+                f"User-Agent: {payload['user_agent'] or 'Not provided'}",
+            ]
+        )
+    )
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        server.ehlo()
+        if SMTP_USE_TLS:
+            server.starttls()
+            server.ehlo()
+        if SMTP_USER and SMTP_PASSWORD:
+            server.login(SMTP_USER, SMTP_PASSWORD)
+        server.send_message(msg)
 
 
 def build_demo_result(
@@ -362,13 +440,20 @@ def build_demo_result(
 
 @app.after_request
 def add_demo_cors_headers(response: Any) -> Any:
-    if request.path.startswith("/demo/"):
-        origin = request_origin()
-        if is_demo_origin_allowed(origin):
-            response.headers["Access-Control-Allow-Origin"] = origin
-            response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-            response.headers["Vary"] = "Origin"
+    origin = request_origin()
+
+    if request.path.startswith("/demo/") and is_demo_origin_allowed(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Vary"] = "Origin"
+
+    if request.path == "/pilot-request" and is_pilot_origin_allowed(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Vary"] = "Origin"
+
     return response
 
 
@@ -389,6 +474,7 @@ def root() -> Any:
             "POST /v1/verification-sessions/<session_id>/complete",
             "GET /v1/verification-requests/<request_id>/artifact",
             "POST /demo/verify",
+            "POST /pilot-request",
         ],
     })
 
@@ -725,6 +811,75 @@ def demo_verify() -> Any:
         simulate_expired=simulate_expired,
     )
     return jsonify(result)
+
+
+@app.route("/pilot-request", methods=["POST", "OPTIONS"])
+def pilot_request() -> Any:
+    origin = request_origin()
+
+    if request.method == "OPTIONS":
+        if origin and not is_pilot_origin_allowed(origin):
+            return jsonify({"error": "PILOT_ORIGIN_NOT_ALLOWED"}), 403
+        return ("", 204)
+
+    if origin and not is_pilot_origin_allowed(origin):
+        return jsonify({"error": "PILOT_ORIGIN_NOT_ALLOWED"}), 403
+
+    if pilot_rate_limited(client_ip()):
+        return jsonify({
+            "error": "RATE_LIMITED",
+            "message": "Too many pilot requests from this IP. Please try again later.",
+        }), 429
+
+    body = json_body()
+    payload = {
+        "name": str(body.get("name") or "").strip(),
+        "company": str(body.get("company") or "").strip(),
+        "email": str(body.get("email") or "").strip(),
+        "volume": str(body.get("volume") or "").strip(),
+        "notes": str(body.get("notes") or body.get("use_case") or "").strip(),
+        "origin": origin,
+        "ip": client_ip(),
+        "user_agent": request.headers.get("User-Agent", "").strip(),
+    }
+
+    if not payload["name"] or not payload["company"] or not payload["email"] or not payload["notes"]:
+        return jsonify({
+            "error": "MISSING_REQUIRED_FIELDS",
+            "message": "Please complete Full name, Company / team, Work email, and Use case before submitting.",
+        }), 400
+
+    if not valid_email(payload["email"]):
+        return jsonify({
+            "error": "INVALID_EMAIL",
+            "message": "Please enter a valid work email address.",
+        }), 400
+
+    if len(payload["name"]) > 120 or len(payload["company"]) > 160 or len(payload["email"]) > 200 or len(payload["volume"]) > 120 or len(payload["notes"]) > 4000:
+        return jsonify({
+            "error": "FIELD_TOO_LONG",
+            "message": "One or more fields are too long.",
+        }), 400
+
+    try:
+        send_pilot_request_email(payload)
+    except RuntimeError as exc:
+        if str(exc) == "PILOT_EMAIL_NOT_CONFIGURED":
+            return jsonify({
+                "error": "PILOT_EMAIL_NOT_CONFIGURED",
+                "message": "Pilot request email is not configured on the server yet.",
+            }), 500
+        raise
+    except Exception:
+        return jsonify({
+            "error": "EMAIL_DELIVERY_FAILED",
+            "message": "Could not send your request right now. Please try again in a moment.",
+        }), 502
+
+    return jsonify({
+        "ok": True,
+        "message": "Your request has been sent successfully.",
+    })
 
 
 if __name__ == "__main__":
