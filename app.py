@@ -19,7 +19,7 @@ from flask import Flask, jsonify, request
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-APP_VERSION = "0.1.3-mvp-contact-resend"
+APP_VERSION = "0.1.4-mvp-contact-resend-fixed"
 ARTIFACT_VERSION = "pp_v1"
 ALGORITHM = "Ed25519"
 PAYLOAD_FIELDS = [
@@ -336,44 +336,75 @@ def valid_email(value: str) -> bool:
 
 
 def send_pilot_request_email(payload: Dict[str, str]) -> None:
-    if not SMTP_HOST:
+    if not RESEND_API_KEY or not RESEND_FROM or not PILOT_REQUEST_TO:
         raise RuntimeError("PILOT_EMAIL_NOT_CONFIGURED")
 
-    msg = EmailMessage()
-    msg["Subject"] = f"New PayeeProof pilot request — {payload['company']}"
-    msg["From"] = SMTP_FROM
-    msg["To"] = PILOT_REQUEST_TO
-    msg["Reply-To"] = payload["email"]
-    msg.set_content(
-        "\n".join(
-            [
-                "New PayeeProof pilot request",
-                "",
-                f"Name: {payload['name']}",
-                f"Company / team: {payload['company']}",
-                f"Work email: {payload['email']}",
-                f"Monthly payout volume: {payload['volume'] or 'Not provided'}",
-                "",
-                "Use case / flow:",
-                payload["notes"],
-                "",
-                f"Submitted at (UTC): {iso_z(now_utc())}",
-                f"Origin: {payload['origin'] or 'Not provided'}",
-                f"IP: {payload['ip']}",
-                f"User-Agent: {payload['user_agent'] or 'Not provided'}",
-            ]
-        )
+    subject = f"New PayeeProof pilot request — {payload['company']}"
+    submitted_at = iso_z(now_utc())
+    text_body = "\n".join(
+        [
+            "New PayeeProof pilot request",
+            "",
+            f"Name: {payload['name']}",
+            f"Company / team: {payload['company']}",
+            f"Work email: {payload['email']}",
+            f"Monthly payout volume: {payload['volume'] or 'Not provided'}",
+            "",
+            "Use case / flow:",
+            payload["notes"],
+            "",
+            f"Submitted at (UTC): {submitted_at}",
+            f"Origin: {payload['origin'] or 'Not provided'}",
+            f"IP: {payload['ip']}",
+            f"User-Agent: {payload['user_agent'] or 'Not provided'}",
+        ]
     )
+    notes_html = html.escape(payload["notes"]).replace("\n", "<br>")
+    html_body = f"""
+    <div style=\"font-family:Arial,Helvetica,sans-serif;line-height:1.6;color:#111\">
+      <h2>New PayeeProof pilot request</h2>
+      <p><strong>Name:</strong> {html.escape(payload['name'])}<br>
+      <strong>Company / team:</strong> {html.escape(payload['company'])}<br>
+      <strong>Work email:</strong> {html.escape(payload['email'])}<br>
+      <strong>Monthly payout volume:</strong> {html.escape(payload['volume'] or 'Not provided')}</p>
+      <p><strong>Use case / flow:</strong><br>{notes_html}</p>
+      <hr>
+      <p style=\"font-size:12px;color:#555\">Submitted at (UTC): {html.escape(submitted_at)}<br>
+      Origin: {html.escape(payload['origin'] or 'Not provided')}<br>
+      IP: {html.escape(payload['ip'])}<br>
+      User-Agent: {html.escape(payload['user_agent'] or 'Not provided')}</p>
+    </div>
+    """.strip()
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-        server.ehlo()
-        if SMTP_USE_TLS:
-            server.starttls()
-            server.ehlo()
-        if SMTP_USER and SMTP_PASSWORD:
-            server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
-
+    resend_payload = {
+        "from": RESEND_FROM,
+        "to": [PILOT_REQUEST_TO],
+        "subject": subject,
+        "reply_to": payload["email"],
+        "text": text_body,
+        "html": html_body,
+    }
+    data = json.dumps(resend_payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{RESEND_API_BASE}/emails",
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            if resp.status < 200 or resp.status >= 300:
+                raise RuntimeError(f"RESEND_HTTP_{resp.status}: {body[:500]}")
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace") if hasattr(exc, 'read') else str(exc)
+        raise RuntimeError(f"RESEND_HTTP_{exc.code}: {details[:1000]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"RESEND_URL_ERROR: {exc}") from exc
 
 def build_demo_result(
     expected: Dict[str, str],
@@ -869,6 +900,7 @@ def pilot_request() -> Any:
                 "message": "Pilot request email is not configured on the server yet.",
             }), 500
         app.logger.exception("Pilot request email delivery failed: %s", error_code)
+        app.logger.error("Pilot request payload company=%s email=%s", payload.get("company"), payload.get("email"))
         return jsonify({
             "error": "EMAIL_DELIVERY_FAILED",
             "message": "Could not send your request right now. Please try again in a moment.",
