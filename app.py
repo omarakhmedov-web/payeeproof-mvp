@@ -19,7 +19,7 @@ from flask import Flask, jsonify, request
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-APP_VERSION = "0.1.4-mvp-contact-resend-fixed"
+APP_VERSION = "0.1.5-mvp-contact-resend-debug"
 ARTIFACT_VERSION = "pp_v1"
 ALGORITHM = "Ed25519"
 PAYLOAD_FIELDS = [
@@ -898,18 +898,22 @@ def pilot_request() -> Any:
             return jsonify({
                 "error": "PILOT_EMAIL_NOT_CONFIGURED",
                 "message": "Pilot request email is not configured on the server yet.",
+                "debug_detail": error_code,
             }), 500
         app.logger.exception("Pilot request email delivery failed: %s", error_code)
         app.logger.error("Pilot request payload company=%s email=%s", payload.get("company"), payload.get("email"))
         return jsonify({
             "error": "EMAIL_DELIVERY_FAILED",
             "message": "Could not send your request right now. Please try again in a moment.",
+            "debug_detail": error_code,
         }), 502
-    except Exception:
+    except Exception as exc:
+        detail = f"UNEXPECTED_ERROR: {exc!r}"
         app.logger.exception("Pilot request email delivery failed with unexpected error")
         return jsonify({
             "error": "EMAIL_DELIVERY_FAILED",
             "message": "Could not send your request right now. Please try again in a moment.",
+            "debug_detail": detail,
         }), 502
 
     return jsonify({
