@@ -19,7 +19,7 @@ from flask import Flask, jsonify, request
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-APP_VERSION = "0.1.5-mvp-contact-resend-debug"
+APP_VERSION = "0.1.6-mvp-contact-resend-user-agent-fix"
 ARTIFACT_VERSION = "pp_v1"
 ALGORITHM = "Ed25519"
 PAYLOAD_FIELDS = [
@@ -393,6 +393,7 @@ def send_pilot_request_email(payload: Dict[str, str]) -> None:
             "Authorization": f"Bearer {RESEND_API_KEY}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": "PayeeProof/0.1 (+https://payeeproof.com)",
         },
     )
     try:
