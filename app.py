@@ -42,6 +42,12 @@ EVM_NETWORKS = {"ethereum", "polygon", "arbitrum", "base", "bsc"}
 SUPPORTED_NETWORKS = {"ethereum", "polygon", "arbitrum", "base", "bsc", "solana"}
 SUPPORTED_ASSETS = {"USDC", "USDT"}
 RETRY_ALLOWED_CODES = {"ADDRESS_MISMATCH", "NETWORK_MISMATCH", "ASSET_MISMATCH"}
+PERSONAL_EMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "msn.com",
+    "yahoo.com", "ymail.com", "rocketmail.com", "icloud.com", "me.com", "mac.com",
+    "proton.me", "protonmail.com", "pm.me", "mail.com", "aol.com", "gmx.com",
+    "yandex.ru", "yandex.com", "ya.ru", "bk.ru", "inbox.ru", "list.ru", "mail.ru",
+}
 
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:5000").rstrip("/")
 API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "")
@@ -327,16 +333,8 @@ def pilot_rate_limited(ip: str) -> bool:
     return rate_limited(_pilot_hits, ip, PILOT_RATE_LIMIT_PER_10_MIN, 600)
 
 
-PERSONAL_EMAIL_DOMAINS = {
-    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "outlook.com", "hotmail.com",
-    "live.com", "msn.com", "icloud.com", "me.com", "mac.com", "aol.com", "proton.me",
-    "protonmail.com", "pm.me", "mail.com", "gmx.com", "gmx.de", "yandex.ru", "yandex.com",
-    "ya.ru", "bk.ru", "inbox.ru", "list.ru", "mail.ru", "qq.com", "163.com", "126.com"
-}
-
-
 def valid_email(value: str) -> bool:
-    value = str(value or "").strip()
+    value = str(value or "").strip().lower()
     if not value or "@" not in value:
         return False
     local, _, domain = value.partition("@")
@@ -347,7 +345,8 @@ def is_personal_email_domain(value: str) -> bool:
     value = str(value or "").strip().lower()
     if "@" not in value:
         return False
-    return value.partition("@")[2] in PERSONAL_EMAIL_DOMAINS
+    _, _, domain = value.partition("@")
+    return domain in PERSONAL_EMAIL_DOMAINS
 
 
 def send_pilot_request_email(payload: Dict[str, str]) -> None:
@@ -365,7 +364,7 @@ def send_pilot_request_email(payload: Dict[str, str]) -> None:
             f"Work email: {payload['email']}",
             f"Monthly payout volume: {payload['volume'] or 'Not provided'}",
             "",
-            "What payout or verification flow do you want to protect?",
+            "Protected payout / verification flow:",
             payload["notes"],
             "",
             f"Submitted at (UTC): {submitted_at}",
@@ -382,7 +381,7 @@ def send_pilot_request_email(payload: Dict[str, str]) -> None:
       <strong>Company / team:</strong> {html.escape(payload['company'])}<br>
       <strong>Work email:</strong> {html.escape(payload['email'])}<br>
       <strong>Monthly payout volume:</strong> {html.escape(payload['volume'] or 'Not provided')}</p>
-      <p><strong>What payout or verification flow do you want to protect?</strong><br>{notes_html}</p>
+      <p><strong>Protected payout / verification flow:</strong><br>{notes_html}</p>
       <hr>
       <p style=\"font-size:12px;color:#555\">Submitted at (UTC): {html.escape(submitted_at)}<br>
       Origin: {html.escape(payload['origin'] or 'Not provided')}<br>
@@ -891,7 +890,7 @@ def pilot_request() -> Any:
     if not payload["name"] or not payload["company"] or not payload["email"] or not payload["notes"]:
         return jsonify({
             "error": "MISSING_REQUIRED_FIELDS",
-            "message": "Please complete Full name, Company / team, Work email, and What payout or verification flow do you want to protect? before submitting.",
+            "message": "Please complete Full name, Company / team, Work email, and the payout or verification flow field before submitting.",
         }), 400
 
     if not valid_email(payload["email"]):
@@ -940,7 +939,7 @@ def pilot_request() -> Any:
 
     return jsonify({
         "ok": True,
-        "message": "Your request has been sent successfully.",
+        "message": "Request received. We will review your payout or verification flow and reply by email within 1 business day.",
     })
 
 
